@@ -3,11 +3,13 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <algorithm>
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pqxx/pqxx>
 
 const cv::Scalar BLACK = cv::Scalar(0.0, 0.0, 0.0);
 const cv::Scalar YELLOW = cv::Scalar(0.0, 255.0, 255.0);
@@ -18,21 +20,24 @@ const cv::Scalar BLUE = cv::Scalar(255.0, 0.0, 0.0);
 
 const std::string TXT_EXT = ".txt";
 const std::string XML_EXT = ".xml";
+const std::string DB = "database";
 const char ESC_KEY = 27;
 const char SPACE_KEY = 32;
-const std::string extensions[] = {"", TXT_EXT, XML_EXT};
-const int EXT_NUMBER = 3;
+const std::string logTypes[] = {"", TXT_EXT, DB};
+const int TYPES_NUMBER = (sizeof(logTypes)/sizeof(*logTypes)) - 1;
 
 
-
-void readAndLogVideo(cv::VideoCapture &videoCapture, int extensionCode, std::string logName);
-void playVideoWithMarkup(cv::VideoCapture &videoCapture, std::ifstream &log, int extensionCode);
+void readVideoLogToFile(cv::VideoCapture &videoCapture, int logTypeCode, const std::string& logName);
+void readVideoLogToDB(cv::VideoCapture &videoCapture, const std::string& tableName);
+void playVideoWithMarkupFromFile(cv::VideoCapture &videoCapture, std::ifstream &log, int logTypeCode);
+void playVideoWithMarkupFromDB(cv::VideoCapture &videoCapture, std::string &name);
 void track2Frames(cv::Mat &prevFrame, cv::Mat &curFrame, std::vector<Blob> &blobs);
 void log2FramesTXT(std::vector<Blob> &blobs, std::ofstream &outputFile);
 void matchCurrentFrameBlobsToExistingBlobs(std::vector<Blob> &existingBlobs, std::vector<Blob> &currentFrameBlobs);
 void updateExistingBlob(Blob &currentFrameBlob, std::vector<Blob> &existingBlobs, int &index);
 void addNewBlob(Blob &currentFrameBlob, std::vector<Blob> &existingBlobs);
 double distanceBetweenPoints(const cv::Point& point1, const cv::Point& point2);
+std::string loggedTableName(std::ifstream &f, std::string s);
 
 
 int main() {
@@ -46,6 +51,7 @@ int main() {
                   << "Type \"2\" to play the video with markup for tracked objects." << std::endl
                   << "Type \"0\" to exit." << std::endl;
         std::cin >> action;
+        std::getchar();
 
         //Read and log
         switch (action) {
@@ -53,7 +59,8 @@ int main() {
                 //Choose video
                 while (true) {
                     std::cout << "Enter path to the video you want to log." << std::endl;
-                    std::cin >> path;
+                    std::getline(std::cin, path);
+
                     if (path == "0") {
                         return 0;
                     }
@@ -67,24 +74,43 @@ int main() {
                     //std::cout << videoCapture.get(CV_CAP_PROP_FRAME_COUNT) << std::endl;
 
                     if (videoCapture.get(CV_CAP_PROP_FRAME_COUNT) < 2) {
-                        std::cout << "Cannot track anything on a \"video\" with least than two frames." << std::endl
+                        std::cout << "Cannot track anything on a \"video\" with less than two frames." << std::endl
                                   << "Choose another video, please." << std::endl;
                         continue;
                     }
                     break;
                 }
                 //Choose type for log
-                std::cout << "Choose type for the file your video will be logged to." << std:: endl
-                          << "Type \"1\" for .txt." << std::endl;
+                std::cout << "Choose which format your video will be logged in." << std:: endl;
+                for (int i = 1; i <= TYPES_NUMBER; i++) {
+                    std::cout << "Type " + std::to_string(i) + " for " + logTypes[i] << std::endl;
+                }
                 std::cin >> logType;
                 if (path.find_last_of('/') == std::string::npos) {
                     name = path.substr(0, path.find_last_of('.'));
                 } else {
-                    name = path.substr(path.find_last_of('/') + 1);
-                    name = name.substr(0, name.find_last_of('.'));
+                    path = path.substr(path.find_last_of('/') + 1);
+                    name = path.substr(0, path.find_last_of('.'));
                 }
+                if (logTypes[logType] == DB) {
+                    std::string tableName = name;
+                    std::replace(tableName.begin(), tableName.end(), ' ', '_');
+                    tableName = "TABLE_" + tableName;
+                    readVideoLogToDB(videoCapture, tableName);
 
-                readAndLogVideo(videoCapture, logType, name);
+                    std::ifstream dbtables("dbtables.txt");
+                    if (dbtables.is_open()) {
+                        std::string lname = loggedTableName(dbtables, path);
+                        if (lname.empty()) {
+                            dbtables.close();
+                            std::ofstream dbtables("dbtables.txt", std::fstream::app);
+                            dbtables << path << " " << tableName << std::endl;
+                        }
+                    }
+                    dbtables.close();
+                } else {
+                    readVideoLogToFile(videoCapture, logType, name);
+                }
                 break;
 
             //Play video with markup
@@ -94,24 +120,35 @@ int main() {
                 if (path == "0") {
                     return 0;
                 }
+                videoCapture.open(path);
                 if (path.find_last_of('/') == std::string::npos) {
                     name = path.substr(0, path.find_last_of('.'));
                 } else {
-                    name = path.substr(path.find_last_of('/') + 1);
-                    name = name.substr(0, name.find_last_of('.'));
+                    path = path.substr(path.find_last_of('/') + 1);
+                    name = path.substr(0, path.find_last_of('.'));
                 }
                 logType = 0;
-                for (int i = 1; i < EXT_NUMBER; i++) {
-                    std::ifstream log ("tracking_logs/" + name + extensions[i]);
+                for (int i = 1; i < TYPES_NUMBER; i++) {
+                    std::ifstream log ("tracking_logs/" + name + logTypes[i]);
                     if (log.is_open()) {
                         logType = i;
-                        videoCapture.open(path);
-                        playVideoWithMarkup(videoCapture, log, i);
+                        playVideoWithMarkupFromFile(videoCapture, log, i);
                         break;
                     }
                 }
                 if (logType == 0) {
-                    std::cout << "To play this video with markup it have to be logged first." << std::endl;
+                    std::ifstream dbtables("dbtables.txt");
+                    if (dbtables.is_open()) {
+                        std::string lname = loggedTableName(dbtables, path);
+                        if (!lname.empty()) {
+                            playVideoWithMarkupFromDB(videoCapture, lname);
+                            logType = TYPES_NUMBER;
+                        }
+                    }
+                }
+
+                if (logType == 0) {
+                    std::cout << "No logs found for this video. To play it with markup it have to be logged first." << std::endl;
                 }
                 break;
 
@@ -125,12 +162,15 @@ int main() {
     }
 }
 
-void readAndLogVideo(cv::VideoCapture &videoCapture, int extensionCode, std::string logName) {
+
+void readVideoLogToFile(cv::VideoCapture &videoCapture, int logTypeCode, const std::string& logName) {
     cv::Mat prevFrame, curFrame;
     std::vector<Blob> blobs;
-    int frameNumber = 1;
+    std::ofstream log;
     mkdir("tracking_logs", S_IRWXU);
-    std::ofstream log ("tracking_logs/" + logName + extensions[extensionCode]);
+    log = std::ofstream("tracking_logs/" + logName + logTypes[logTypeCode]);
+
+    int frameNumber = 1;
     videoCapture.read(prevFrame);
     videoCapture.read(curFrame);
     while (videoCapture.isOpened()) {
@@ -141,13 +181,12 @@ void readAndLogVideo(cv::VideoCapture &videoCapture, int extensionCode, std::str
             std::cout << "That's all Folks!" << std::endl;
             break;
         }
-        switch (extensionCode) {
+        switch (logTypeCode) {
             case 1:
                 log << frameNumber++ << " ";
                 log2FramesTXT(blobs, log);
                 break;
         }
-
         prevFrame = curFrame.clone();
         if ((videoCapture.get(CV_CAP_PROP_POS_FRAMES) + 1) < videoCapture.get(CV_CAP_PROP_FRAME_COUNT)) {
             videoCapture.read(curFrame);
@@ -164,6 +203,70 @@ void readAndLogVideo(cv::VideoCapture &videoCapture, int extensionCode, std::str
     }
     log.close();
 }
+
+
+void readVideoLogToDB(cv::VideoCapture &videoCapture, const std::string& tableName) {
+    cv::Mat prevFrame, curFrame;
+    std::vector<Blob> blobs;
+
+    try {
+        pqxx::connection C(
+                "dbname = vehicle_counter_db user = vehicle_counter password = vc12345 hostaddr=127.0.0.1 port=5432");
+        std::cout << "Connected to " << C.dbname() << std::endl;
+        pqxx::work W(C);
+
+        W.exec("DROP TABLE " + tableName + ";");
+        W.exec("CREATE TABLE " + tableName + "(" \
+        "FRAME_ID INT NOT NULL, " \
+        "BLOB_ID INT NOT NULL, " \
+        "X INT NOT NULL, " \
+        "Y INT NOT NULL, " \
+        "WIDTH INT NOT NULL, " \
+        "HEIGHT INT NOT NULL, " \
+        "CONSTRAINT " + tableName + "_PK PRIMARY KEY (FRAME_ID, BLOB_ID));");
+
+        int frameNumber = 1;
+        videoCapture.read(prevFrame);
+        videoCapture.read(curFrame);
+
+        while (videoCapture.isOpened()) {
+            try {
+                track2Frames(prevFrame, curFrame, blobs);
+            } catch (cv::Exception &e) {
+                std::cout << e.msg;
+                std::cout << "That's all Folks!" << std::endl;
+                break;
+            }
+
+            std::string insert;
+            for (unsigned int i = 0; i < blobs.size(); i++) {
+                if (blobs[i].blnStillBeingTracked) {
+                    insert = "INSERT INTO " + tableName + " (FRAME_ID, BLOB_ID, X, Y, WIDTH, HEIGHT) " +
+                             "VALUES (" + std::to_string(frameNumber) + ", " +
+                             std::to_string(i) + ", " +
+                             std::to_string(blobs[i].currentBoundingRect.x) + ", " +
+                             std::to_string(blobs[i].currentBoundingRect.y) + ", " +
+                             std::to_string(blobs[i].currentBoundingRect.width) + ", " +
+                             std::to_string(blobs[i].currentBoundingRect.height) + ");";
+                    W.exec(insert);
+                }
+            }
+
+            frameNumber++;
+            prevFrame = curFrame.clone();
+            if ((videoCapture.get(CV_CAP_PROP_POS_FRAMES) + 1) < videoCapture.get(CV_CAP_PROP_FRAME_COUNT)) {
+                videoCapture.read(curFrame);
+            } else {
+                std::cout << "end of video\n";
+                break;
+            }
+        }
+        W.commit();
+    } catch (const std::exception &e) {
+        std::cerr << e.what() << std::endl;
+    }
+}
+
 
 void track2Frames(cv::Mat &prevFrame, cv::Mat &curFrame, std::vector<Blob> &blobs) {
     std::vector<Blob> curFrameBlobs;
@@ -220,9 +323,8 @@ void track2Frames(cv::Mat &prevFrame, cv::Mat &curFrame, std::vector<Blob> &blob
 //    cv::imshow("curFrameCopy", curFrameCopy);
 
     matchCurrentFrameBlobsToExistingBlobs(blobs, curFrameBlobs);
-
-
 }
+
 
 void matchCurrentFrameBlobsToExistingBlobs(std::vector<Blob> &existingBlobs, std::vector<Blob> &currentFrameBlobs) {
     for (auto &existingBlob : existingBlobs) {
@@ -265,6 +367,7 @@ void matchCurrentFrameBlobsToExistingBlobs(std::vector<Blob> &existingBlobs, std
     }
 }
 
+
 void updateExistingBlob(Blob &currentFrameBlob, std::vector<Blob> &existingBlobs, int &index) {
     existingBlobs[index].currentContour = currentFrameBlob.currentContour;
     existingBlobs[index].currentBoundingRect = currentFrameBlob.currentBoundingRect;
@@ -289,24 +392,30 @@ double distanceBetweenPoints(const cv::Point& point1, const cv::Point& point2) {
     return(sqrt(pow(intX, 2) + pow(intY, 2)));
 }
 
+
 void log2FramesTXT(std::vector<Blob> &blobs, std::ofstream &outputFile) {
     for (unsigned int i = 0; i < blobs.size(); i++) {
         if (blobs[i].blnStillBeingTracked) {
-            outputFile << i << " " << blobs[i].currentBoundingRect.x << " " << blobs[i].currentBoundingRect.y
-                       << " " << blobs[i].currentBoundingRect.width << " " << blobs[i].currentBoundingRect.height << " ";
+            outputFile << i << " " << blobs[i].currentBoundingRect.x
+                       << " " << blobs[i].currentBoundingRect.y
+                       << " " << blobs[i].currentBoundingRect.width
+                       << " " << blobs[i].currentBoundingRect.height << " ";
         }
     }
     outputFile << std::endl;
 }
 
-void playVideoWithMarkup(cv::VideoCapture &videoCapture, std::ifstream &log, int extensionCode) {
+
+//TODO: transform switch, make player class
+
+void playVideoWithMarkupFromFile(cv::VideoCapture &videoCapture, std::ifstream &log, int logTypeCode) {
     char checkForKey = 0;
     bool paused = false;
     cv::Mat frame;
     videoCapture.read(frame);
     double fontScale = (frame.rows * frame.cols) / 300000.0;
     int fontThickness = (int)std::round(fontScale * 1.0);
-    switch (extensionCode) {
+    switch (logTypeCode) {
         case 1:
             std::string s;
             while (getline(log, s) && checkForKey != ESC_KEY) {
@@ -337,6 +446,81 @@ void playVideoWithMarkup(cv::VideoCapture &videoCapture, std::ifstream &log, int
                 std::cout << "end of video\n";
                 cv::waitKey(0);
             }
+            cv::destroyAllWindows();
             return;
     }
 }
+
+
+void playVideoWithMarkupFromDB(cv::VideoCapture &videoCapture, std::string &name) {
+    char checkForKey = 0;
+    bool paused = false;
+    int frameCount = 1;
+    cv::Mat frame;
+    videoCapture.read(frame);
+    double fontScale = (frame.rows * frame.cols) / 300000.0;
+    int fontThickness = (int)std::round(fontScale * 1.0);
+
+    try {
+        pqxx::connection C(
+                "dbname = vehicle_counter_db user = vehicle_counter password = vc12345 hostaddr=127.0.0.1 port=5432");
+        std::cout << "Connected to " << C.dbname() << std::endl;
+        pqxx::work W(C);
+        pqxx::result R = W.exec("SELECT count(*) FROM " + name + ";");
+        int blob, x, y, width, height;
+        int count = std::stoi(R[0][0].c_str()); // is there a less clumsy way?
+        while (count > 0 && checkForKey != ESC_KEY) {
+            R = W.exec("SELECT * FROM " + name + " WHERE FRAME_ID = " + std::to_string(frameCount) + ";");
+            videoCapture.read(frame);
+            for (const auto& row : R) {
+                blob = std::stoi(row[1].c_str());
+                x = std::stoi(row[2].c_str());
+                y = std::stoi(row[3].c_str());
+                width = std::stoi(row[4].c_str());
+                height = std::stoi(row[5].c_str());
+                cv::rectangle(frame, cv::Point(x, y), cv::Point(x + width, y + height), RED, 2);
+                cv::putText(frame, std::to_string(blob), cv::Point(x + width / 2, y + height / 2),
+                            CV_FONT_HERSHEY_SIMPLEX, fontScale, GREEN, fontThickness);
+            }
+
+            cv::imshow("VideoWithMarkup", frame);
+
+            if (!paused) {
+                checkForKey = cv::waitKey(15);
+                paused = (checkForKey == SPACE_KEY);
+            }
+
+            if (paused) {
+                checkForKey = cv::waitKey(0);
+                if (checkForKey == SPACE_KEY)
+                    paused = false;
+            }
+
+            frameCount++;
+            count -= R.size();
+        }
+        if (checkForKey != ESC_KEY) {
+            std::cout << "end of video\n";
+            cv::waitKey(0);
+        }
+        cv::destroyAllWindows();
+        return;
+
+    } catch (const std::exception &e) {
+        std::cerr << e.what() << std::endl;
+    }
+}
+
+
+std::string loggedTableName(std::ifstream &f, std::string sp) {
+    std::string s, s1, s2;
+    while (getline(f, s)) {
+        std::istringstream ss(s);
+        ss >> s1 >> s2;
+        if (s1 == sp) {
+            return s2;
+        }
+    }
+    return "";
+}
+//         pqxx::connection C("dbname = vehicle_counter_db user = vehicle_counter password = vc12345 hostaddr=127.0.0.1 port=5432");
